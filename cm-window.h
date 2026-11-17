@@ -67,11 +67,29 @@ typedef struct _win {
   int damaged;
   Damage damage;
   Picture picture;
+  /* Snapshot of the last visible content, used for fade-out after the
+     client window is gone.  Kept up to date while the window is visible.
+     Stored at half resolution and scaled when painted. */
+  Pixmap fade_pixmap;
+  Picture fade_picture;
+  int fade_w;
+  int fade_h;
+  unsigned long long last_snap_ms; /* monotonic time of the last refresh */
+  Pixmap alpha_pixmap;
   Picture alpha_pict;
+  unsigned int alpha_pict_value;
+  Bool had_children; /* had client subwindows when mapped */
   Picture alpha_border_pict;
   Picture shadow_pict;
   XserverRegion border_size;
   XserverRegion extents;
+  /* Anti-aliased rounded-corner mask (A8, window sized). */
+  Pixmap rounded_mask_pixmap;
+  Picture rounded_mask_picture;
+  /* Hard-edged rounded region, used while fading (the opacity is applied
+     through the regular alpha mask, which cannot be combined with the
+     anti-aliased mask). */
+  XserverRegion rounded;
   Picture shadow;
   int shadow_dx;
   int shadow_dy;
@@ -84,6 +102,8 @@ typedef struct _win {
   shadowtype shadow_type;
   unsigned long damage_sequence; /* sequence when damage was created */
   Bool destroyed;
+  Bool content_gone; /* client subwindow vanished: draw the snapshot */
+  Bool snapshot_stale; /* refresh the snapshot on the next paint */
   Bool paint_needed;
   unsigned int left_width;
   unsigned int right_width;

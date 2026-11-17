@@ -36,7 +36,6 @@
 #include "cm-util.h"
 #include "cm-window.h"
 #include "comp_rect.h"
-#include "ringbuffer.h"
 
 
 typedef struct _ignore {
@@ -67,6 +66,7 @@ Picture cshadow_picture;
 Picture root_tile;
 XserverRegion all_damage;
 XserverRegion g_xregion_tmp;
+XserverRegion g_saved_damage;
 Bool all_damage_is_dirty;
 Bool clip_changed;
 #if HAS_NAME_WINDOW_PIXMAP
@@ -85,7 +85,6 @@ double win_type_opacity[NUM_WINTYPES];
 Bool win_type_shadow[NUM_WINTYPES];
 Bool win_type_fade[NUM_WINTYPES];
 
-#define REGISTER_PROP "_NET_WM_CM_S"
 
 #define OPAQUE 0xffffffff
 
@@ -120,19 +119,34 @@ set_paint_ignore_region_dirty(void);
 static XserverRegion
 win_extents(Display *dpy, win *w);
 
+static void
+rebuild_shadow(Display *dpy, win *w);
+
+static void
+update_fade_snapshot(Display *dpy, win *w);
+
 int shadow_radius = 12;
 int shadow_offset_x = -15;
 int shadow_offset_y = -15;
 double shadow_opacity = .75;
 
-double fade_in_step = 0.028;
-double fade_out_step = 0.03;
-int fade_delta = 10;
+double fade_in_step = 0.08;
+double fade_out_step = 0.08;
+int fade_delta = 32;
 int fade_time = 0;
 Bool fade_trans = False;
 
 double inactive_opacity = 0;
 double frame_opacity = 0;
+
+int corner_radius = 8;
+#define MAX_CORNER_RADIUS 64
+
+/* Minimum interval between fade-snapshot refreshes.  High-frequency damage
+   (scrolling, animations) would otherwise re-scale the whole window on
+   every damage event.  Capped at one frame of content, so the snapshot is
+   at most one frame behind when a fade-out starts. */
+#define SNAPSHOT_MIN_INTERVAL_MS 16
 
 #define INACTIVE_OPACITY \
 (unsigned long)((double)inactive_opacity * OPAQUE)
@@ -186,7 +200,7 @@ cleanup_fade(Display *dpy, win *w) {
 
 void
 enqueue_fade(Display *dpy, fade *f) {
-  if (!fades) {
+  if (!fades || fade_time < get_time_in_milliseconds()) {
     fade_time = get_time_in_milliseconds() + fade_delta;
   }
   f->next = fades;
@@ -203,6 +217,7 @@ set_fade(Display *dpy, win *w, double start,
   f = find_fade(w);
   if (!f) {
     f = malloc(sizeof(fade));
+    if (!f) return;
     f->next = 0;
     f->w = w;
     f->cur = start;
@@ -223,23 +238,24 @@ set_fade(Display *dpy, win *w, double start,
     f->step = step;
   } else if (f->cur > finish) {
     f->step = -step;
+  } else {
+    /* Already at the target: complete immediately instead of spinning with
+       an uninitialized step.  The callback may free the window, so finish
+       here. */
+    f->callback = callback;
+    w->opacity = finish * OPAQUE;
+    determine_mode(dpy, w);
+    dequeue_fade(dpy, f);
+    return;
   }
 
   f->callback = callback;
   w->opacity = f->cur * OPAQUE;
 
-#if 0
-  printf("set_fade start %g step %g\n", f->cur, f->step);
-#endif
 
   determine_mode(dpy, w);
 
-  if (w->shadow) {
-    // rebuild the shadow
-    XRenderFreePicture(dpy, w->shadow);
-    w->shadow = None;
-    win_extents(dpy, w);
-  }
+  rebuild_shadow(dpy, w);
 
   /* fading windows need to be drawn, mark
      them as damaged.  when a window maps,
@@ -273,9 +289,6 @@ run_fades(Display *dpy) {
   int steps;
   Bool need_dequeue;
 
-#if 0
-  printf("run fades\n");
-#endif
 
   if (fade_time - now > 0) return;
   steps = 1 + (now - fade_time) / fade_delta;
@@ -292,9 +305,6 @@ run_fades(Display *dpy) {
       f->cur = 0;
     }
 
-#if 0
-    printf("opacity now %g\n", f->cur);
-#endif
 
     w->opacity = f->cur * OPAQUE;
     need_dequeue = False;
@@ -513,7 +523,7 @@ static void make_transparent_shadowcenter(int width, int height, int swidth, int
     assert(x >=0 && x < swidth);
     assert(x+x_diff <= swidth);
     for(; y < ylimit ; y++){
-      memset(&data[y * swidth + x], 0, x_diff);
+      memset(&data[(size_t)y * swidth + x], 0, x_diff);
     }
   }
 }
@@ -533,7 +543,7 @@ make_shadow(Display *dpy, double opacity,
   int x_diff;
   int opacity_int = (int)(opacity * 25);
 
-  data = malloc(swidth * sheight * sizeof(unsigned char));
+  data = malloc((size_t)swidth * (size_t)sheight);
   if (!data) return 0;
 
   ximage = XCreateImage(
@@ -770,14 +780,33 @@ static bool shadow_should_render(shadowtype t){
   return false;
 }
 
+static void
+rebuild_shadow(Display *dpy, win *w) {
+  if (w->shadow) {
+    XRenderFreePicture(dpy, w->shadow);
+    w->shadow = None;
+    win_extents(dpy, w);
+  }
+}
+
+static void
+win_outer_rect(win *w, int *x, int *y, int *wd, int *ht) {
+  if (x) *x = w->a.x;
+  if (y) *y = w->a.y;
+  if (wd) *wd = w->a.width + w->a.border_width * 2;
+  if (ht) *ht = w->a.height + w->a.border_width * 2;
+}
+
 static XserverRegion
 win_extents(Display *dpy, win *w) {
   XRectangle r;
+  int x, y, wd, ht;
 
-  r.x = w->a.x;
-  r.y = w->a.y;
-  r.width = w->a.width + w->a.border_width * 2;
-  r.height = w->a.height + w->a.border_width * 2;
+  win_outer_rect(w, &x, &y, &wd, &ht);
+  r.x = x;
+  r.y = y;
+  r.width = wd;
+  r.height = ht;
 
   if(unlikely(w->shadow_type == SHADOW_UNKNOWN)){
     w->shadow_type = shadow_find_type(w);
@@ -842,26 +871,217 @@ win_extents(Display *dpy, win *w) {
 static XserverRegion
 border_size(Display *dpy, win *w) {
   XserverRegion border;
+  XWindowAttributes a;
 
-  /*
-   * if window doesn't exist anymore,  this will generate an error
-   * as well as not generate a region.  Perhaps a better XFixes
-   * architecture would be to have a request that copies instead
-   * of creates, that way you'd just end up with an empty region
-   * instead of an invalid XID.
-   */
-
+  /* Prefer the real window shape while the window exists.  Once it is gone
+     (during a fade-out) fall back to the cached rectangle, since the shape
+     request would fail and return an invalid region. */
   set_ignore(dpy, NextRequest(dpy));
-  border = XFixesCreateRegionFromWindow(
-    dpy, w->id, WindowRegionBounding);
+  if (XGetWindowAttributes(dpy, w->id, &a)) {
+    set_ignore(dpy, NextRequest(dpy));
+    border = XFixesCreateRegionFromWindow(dpy, w->id, WindowRegionBounding);
+    set_ignore(dpy, NextRequest(dpy));
+    XFixesTranslateRegion(dpy, border,
+        w->a.x + w->a.border_width,
+        w->a.y + w->a.border_width);
+    return border;
+  }
 
-  /* translate this */
-  set_ignore(dpy, NextRequest(dpy));
-  XFixesTranslateRegion(dpy, border,
-    w->a.x + w->a.border_width,
-    w->a.y + w->a.border_width);
+  {
+    XRectangle r;
+    int x, y, wd, ht;
+    win_outer_rect(w, &x, &y, &wd, &ht);
+    r.x = x;
+    r.y = y;
+    r.width = wd;
+    r.height = ht;
+    return XFixesCreateRegion(dpy, &r, 1);
+  }
+}
 
-  return border;
+/* Anti-aliased quarter-circle alpha templates: 0=TL, 1=TR, 2=BL, 3=BR. */
+static Picture corner_pics[4];
+
+static unsigned char *
+corner_alpha_data(int r, int dir) {
+  unsigned char *data = calloc(r * r, 1);
+  int x, y, sx, sy;
+
+  if (!data) return NULL;
+
+  for (y = 0; y < r; y++) {
+    for (x = 0; x < r; x++) {
+      int cover = 0;
+      for (sy = 0; sy < 4; sy++) {
+        for (sx = 0; sx < 4; sx++) {
+          double px = x + (sx + 0.5) / 4.0;
+          double py = y + (sy + 0.5) / 4.0;
+          double cx = (dir == 1 || dir == 3) ? 0.0 : (double)r;
+          double cy = (dir == 2 || dir == 3) ? 0.0 : (double)r;
+          if ((px - cx) * (px - cx) + (py - cy) * (py - cy) <= (double)r * r)
+            cover++;
+        }
+      }
+      data[y * r + x] = (unsigned char)(cover * 255 / 16);
+    }
+  }
+  return data;
+}
+
+static void
+init_corner_templates(Display *dpy) {
+  XRenderPictFormat *fmt = XRenderFindStandardFormat(dpy, PictStandardA8);
+  int i, r = (corner_radius + 1) / 2; /* half resolution */
+
+  if (r <= 0 || !fmt) return;
+
+  for (i = 0; i < 4; i++) {
+    unsigned char *data = corner_alpha_data(r, i);
+    Pixmap pm;
+    XImage *img;
+    GC gc;
+    if (!data) continue;
+    pm = XCreatePixmap(dpy, DefaultRootWindow(dpy), r, r, 8);
+    if (!pm) { free(data); continue; }
+    img = XCreateImage(dpy, NULL, 8, ZPixmap, 0, (char *)data, r, r, 8, 0);
+    if (!img) { free(data); XFreePixmap(dpy, pm); continue; }
+    gc = XCreateGC(dpy, pm, 0, NULL);
+    if (!gc) { XDestroyImage(img); XFreePixmap(dpy, pm); continue; }
+    XPutImage(dpy, pm, gc, img, 0, 0, 0, 0, r, r);
+    XFreeGC(dpy, gc);
+    XDestroyImage(img);
+    corner_pics[i] = XRenderCreatePicture(dpy, pm, fmt, 0, NULL);
+    XFreePixmap(dpy, pm);
+  }
+}
+
+/* Hard-edged rounded region (used while fading, where the opacity mask is
+   needed; the anti-aliased mask cannot carry the opacity). */
+static XserverRegion
+win_rounded_region(Display *dpy, win *w) {
+  XRectangle rects[2 * MAX_CORNER_RADIUS + 1];
+  XRectangle full;
+  int r = corner_radius;
+  int x, y, wd, ht, n = 0, i;
+
+  x = w->a.x;
+  y = w->a.y;
+  wd = w->a.width + w->a.border_width * 2;
+  ht = w->a.height + w->a.border_width * 2;
+
+  if (wd <= 0 || ht <= 0) return None;
+  if (r > wd / 2) r = wd / 2;
+  if (r > ht / 2) r = ht / 2;
+
+  if (r <= 0) {
+    full.x = x;
+    full.y = y;
+    full.width = wd;
+    full.height = ht;
+    return XFixesCreateRegion(dpy, &full, 1);
+  }
+
+  for (i = 0; i < r; i++) {
+    double dy = i + 0.5 - r;
+    int dx = r - (int)(sqrt(r * r - dy * dy) + 0.5);
+    rects[n].x = x + dx;
+    rects[n].y = y + i;
+    rects[n].width = wd - 2 * dx;
+    rects[n].height = 1;
+    n++;
+  }
+
+  if (ht > 2 * r) {
+    rects[n].x = x;
+    rects[n].y = y + r;
+    rects[n].width = wd;
+    rects[n].height = ht - 2 * r;
+    n++;
+  }
+
+  for (i = 0; i < r; i++) {
+    double dy = r - i - 0.5;
+    int dx = r - (int)(sqrt(r * r - dy * dy) + 0.5);
+    rects[n].x = x + dx;
+    rects[n].y = y + ht - 1 - i;
+    rects[n].width = wd - 2 * dx;
+    rects[n].height = 1;
+    n++;
+  }
+
+  return XFixesCreateRegion(dpy, rects, n);
+}
+
+static void
+update_rounded_region(Display *dpy, win *w) {
+  if (w->rounded) {
+    XFixesDestroyRegion(dpy, w->rounded);
+    w->rounded = None;
+  }
+  if (corner_radius <= 0) return;
+  if (w->window_type == WINTYPE_DOCK || w->window_type == WINTYPE_DESKTOP)
+    return;
+  w->rounded = win_rounded_region(dpy, w);
+}
+
+static void
+update_rounded_mask(Display *dpy, win *w) {
+  XRenderPictFormat *fmt = XRenderFindStandardFormat(dpy, PictStandardA8);
+  XRenderColor white;
+  int wd, ht, r = corner_radius;
+
+  if (w->rounded_mask_picture) {
+    XRenderFreePicture(dpy, w->rounded_mask_picture);
+    w->rounded_mask_picture = None;
+  }
+  if (w->rounded_mask_pixmap) {
+    XFreePixmap(dpy, w->rounded_mask_pixmap);
+    w->rounded_mask_pixmap = None;
+  }
+  if (r <= 0 || !fmt) return;
+  if (w->window_type == WINTYPE_DOCK || w->window_type == WINTYPE_DESKTOP)
+    return;
+
+  wd = w->a.width + w->a.border_width * 2;
+  ht = w->a.height + w->a.border_width * 2;
+  if (wd <= 0 || ht <= 0 || wd < 2 * r || ht < 2 * r) return;
+
+  {
+    /* Half-resolution mask: memory drops to a quarter.  The mask is scaled
+       back up during compositing with bilinear filtering (see the picture
+       transform below), which keeps the edges smooth. */
+    int mr = (r + 1) / 2;
+    int mw = (wd + 1) / 2;
+    int mh = (ht + 1) / 2;
+    XTransform t = { { { XDoubleToFixed(0.5), 0, 0 },
+                       { 0, XDoubleToFixed(0.5), 0 },
+                       { 0, 0, XDoubleToFixed(1.0) } } };
+
+    w->rounded_mask_pixmap = XCreatePixmap(
+        dpy, DefaultRootWindow(dpy), mw, mh, 8);
+    w->rounded_mask_picture = XRenderCreatePicture(
+        dpy, w->rounded_mask_pixmap, fmt, 0, NULL);
+
+    white.red = white.green = white.blue = white.alpha = 0xffff;
+    XRenderFillRectangle(dpy, PictOpSrc, w->rounded_mask_picture,
+        &white, 0, 0, mw, mh);
+
+    {
+      int ci;
+      for (ci = 0; ci < 4; ci++) {
+        int cx = (ci & 1) ? mw - mr : 0;
+        int cy = (ci & 2) ? mh - mr : 0;
+        XRenderComposite(dpy, PictOpSrc, corner_pics[ci], None,
+            w->rounded_mask_picture, 0, 0, 0, 0, cx, cy, mr, mr);
+      }
+    }
+
+    /* Sampling uses the mask picture's own coordinates (relative to
+       mask_x/mask_y), so the 0.5 scale maps target pixels to the
+       half-resolution mask regardless of the window position. */
+    XRenderSetPictureTransform(dpy, w->rounded_mask_picture, &t);
+    XRenderSetPictureFilter(dpy, w->rounded_mask_picture, "bilinear", NULL, 0);
+  }
 }
 
 static Window
@@ -938,7 +1158,7 @@ get_frame_extents(win* w,
     &type, &format, &nitems, &after,
     (unsigned char **)&data);
 
-  if (result == Success) {
+  if (result == Success && format == 32) {
     if (nitems == 4 && after == 0) {
       extents = (long *)data;
       *left =
@@ -992,7 +1212,9 @@ win_paint_needed(win* w, CompRect* ignore_reg){
     // (s. e.g. xfce4-screenshooter
     // screenshooter-capture.c::get_rectangle_screenshot_composited )
     if (w->a.map_state != IsViewable || w->destroyed || w->opacity != OPAQUE ||
-        w->a.override_redirect){
+        w->a.override_redirect || w->mode == WINDOW_ARGB){
+      /* ARGB windows may contain translucent content, so they must not be
+         treated as opaque occluders of the windows below them. */
       return True;
     }
     CompRect w_rect = {.x1 = w->a.x, .y1 = w->a.y,
@@ -1001,12 +1223,74 @@ win_paint_needed(win* w, CompRect* ignore_reg){
     return rect_paint_needed(ignore_reg, &w_rect);
 }
 
+/* Maintain a reusable 1x1 alpha mask for the window opacity.  Recreating
+   it every fade frame costs several X requests; refilling one pixel does
+   not, and the value is only uploaded when the opacity changes. */
+static void
+update_alpha_pict(Display *dpy, win *w) {
+  XRenderPictFormat *fmt;
+  XRenderColor c;
+
+  if (w->opacity == OPAQUE) {
+    if (w->alpha_pict) {
+      XRenderFreePicture(dpy, w->alpha_pict);
+      w->alpha_pict = None;
+      w->alpha_pict_value = 0xffffffff;
+    }
+    return;
+  }
+
+  if (!w->alpha_pict) {
+    fmt = XRenderFindStandardFormat(dpy, PictStandardA8);
+    if (!fmt) return;
+    w->alpha_pixmap = XCreatePixmap(dpy, DefaultRootWindow(dpy), 1, 1, 8);
+    if (!w->alpha_pixmap) return;
+    {
+      XRenderPictureAttributes rpa;
+      rpa.repeat = True;
+      w->alpha_pict = XRenderCreatePicture(
+          dpy, w->alpha_pixmap, fmt, CPRepeat, &rpa);
+    }
+    if (!w->alpha_pict) {
+      XFreePixmap(dpy, w->alpha_pixmap);
+      w->alpha_pixmap = None;
+      return;
+    }
+  }
+
+  c.red = c.green = c.blue = 0;
+  c.alpha = (unsigned short)((double)w->opacity / OPAQUE * 0xffff);
+  if (w->alpha_pict_value == c.alpha) return;
+  XRenderFillRectangle(dpy, PictOpSrc, w->alpha_pict, &c, 0, 0, 1, 1);
+  w->alpha_pict_value = c.alpha;
+}
+
 static void
 paint_all(Display *dpy, XserverRegion region) {
   win *w;
   win *t = 0;
   Bool ignore_region_is_dirty = g_paint_ignore_region_is_dirty;
   g_paint_ignore_region_is_dirty = False;
+
+  /* Keep a copy of the original damage: the paint loops below modify the
+     region, but the screen copy at the end must use the untouched set. */
+  XFixesCopyRegion(dpy, g_saved_damage, region);
+
+  /* Damage rectangles, used to skip windows that do not intersect them.
+     Pointless with a single visible window, so fetch only when there are
+     several (avoids one synchronous round-trip in the common single case). */
+  int ndmg_rects = 0;
+  XRectangle *dmg_rects = NULL;
+  {
+    int nvis = 0;
+    win *tw;
+    for (tw = list; tw; tw = tw->next) {
+      if (tw->a.map_state == IsViewable) nvis++;
+    }
+    if (nvis > 1) {
+      dmg_rects = XFixesFetchRegion(dpy, region, &ndmg_rects);
+    }
+  }
 
 #if MONITOR_REPAINT
   root_buffer = root_picture;
@@ -1048,8 +1332,29 @@ paint_all(Display *dpy, XserverRegion region) {
     if (!w->usable) continue;
 #endif
 
-    /* never painted, ignore it */
-    if (likely(!w->damaged)) continue;
+    /* Also repaint windows without their own damage: a repainted (possibly
+       translucent) window above them exposes the background in the damaged
+       area they cover.  Skip those that do not intersect the damage. */
+    int dmg_hit = 1;
+    if (likely(!w->damaged)) {
+      int ri;
+      if (w->a.map_state != IsViewable) continue;
+      dmg_hit = 0;
+      if (dmg_rects) {
+        int wx1 = w->a.x, wy1 = w->a.y;
+        int wx2 = w->a.x + w->a.width + 2 * w->a.border_width;
+        int wy2 = w->a.y + w->a.height + 2 * w->a.border_width;
+        for (ri = 0; ri < ndmg_rects; ri++) {
+          if (wx1 < dmg_rects[ri].x + dmg_rects[ri].width &&
+              wx2 > dmg_rects[ri].x &&
+              wy1 < dmg_rects[ri].y + dmg_rects[ri].height &&
+              wy2 > dmg_rects[ri].y) { dmg_hit = 1; break; }
+        }
+      } else {
+        dmg_hit = 1;
+      }
+      if (!dmg_hit) continue;
+    }
 
     // Note that undamaged windows should not contribute to the ignore
     // region. Otherwise VBoxManager makes other windows disappear during startup.
@@ -1059,7 +1364,16 @@ paint_all(Display *dpy, XserverRegion region) {
       // resides largely outside the screen.
       w->paint_needed = win_paint_needed(w, &ignore_reg);
     }
-    if(!w->paint_needed) continue;
+    if (!w->paint_needed) {
+      if (!w->damaged && dmg_hit) {
+        /* It intersects the newly damaged area: repaint (it may have just
+           become visible again). */
+        w->paint_needed = True;
+        w->snapshot_stale = True;
+      } else {
+        continue;
+      }
+    }
 
     if (!w->picture) {
       XRenderPictureAttributes pa;
@@ -1080,11 +1394,37 @@ paint_all(Display *dpy, XserverRegion region) {
         dpy, draw, format, CPSubwindowMode, &pa);
     }
 
+    /* Seed the fade-out snapshot for windows that may never receive
+       another damage event (static windows). */
+    if (unlikely(!w->fade_picture || w->snapshot_stale)) {
+      w->snapshot_stale = False;
+      update_fade_snapshot(dpy, w);
+    }
+
+    /* (Re)create the rounded-corner mask/region on first paint after a
+       map; both are released when the window is unmapped. */
+    if (corner_radius > 0
+        && w->window_type != WINTYPE_DOCK
+        && w->window_type != WINTYPE_DESKTOP) {
+      if (!w->rounded_mask_picture) {
+        update_rounded_mask(dpy, w);
+      }
+      if (!w->rounded) {
+        update_rounded_region(dpy, w);
+      }
+    }
+
+    /* Fade-out a snapshot when the live window contents are already gone.
+       Visible windows must always be painted from their live contents. */
+    Picture picture = (w->destroyed || w->a.map_state != IsViewable || w->content_gone)
+        ? (w->fade_picture ? w->fade_picture : w->picture)
+        : w->picture;
+
 #if DEBUG_REPAINT
     printf(" 0x%x", w->id);
 #endif
 
-    if (clip_changed) {
+    if (clip_changed && !w->destroyed && w->a.map_state == IsViewable) {
       if (w->border_size) {
         set_ignore(dpy, NextRequest(dpy));
         XFixesDestroyRegion(dpy, w->border_size);
@@ -1094,7 +1434,13 @@ paint_all(Display *dpy, XserverRegion region) {
     }
 
     if (!w->border_size) {
+      /* The X window may already be gone while its fade-out is still being
+         painted.  XFixesCreateRegionFromWindow would fail and return an
+         invalid region, which would be used for every remaining fade step.
+         Keep the last valid region instead. */
+      if (w->destroyed || w->a.map_state != IsViewable) continue;
       w->border_size = border_size (dpy, w);
+      if (!w->border_size) continue;
     }
 
     if (unlikely(!w->extents)) {
@@ -1122,13 +1468,26 @@ paint_all(Display *dpy, XserverRegion region) {
       set_ignore(dpy, NextRequest(dpy));
       XFixesSubtractRegion(dpy, region, region, w->border_size);
 
-      XRenderComposite(
-        dpy, PictOpSrc, w->picture,
-        None, root_buffer, 0, 0, 0, 0,
-        x, y, wid, hei);
+      if (w->rounded_mask_picture) {
+        XRenderComposite(
+          dpy, PictOpOver, picture,
+          w->rounded_mask_picture, root_buffer, 0, 0, 0, 0,
+          x, y, wid, hei);
+      } else {
+        XRenderComposite(
+          dpy, PictOpSrc, picture,
+          None, root_buffer, 0, 0, 0, 0,
+          x, y, wid, hei);
+      }
     }
 
     XFixesCopyRegion(dpy, w->border_clip, region);
+    /* The hard-edged region is only needed while fading: at full opacity
+       the anti-aliased mask handles the corners, and intersecting here
+       would cut away its edge pixels. */
+    if (w->rounded && w->opacity != OPAQUE) {
+      XFixesIntersectRegion(dpy, w->border_clip, w->border_clip, w->rounded);
+    }
 
     w->prev_trans = t;
     t = w;
@@ -1144,10 +1503,22 @@ paint_all(Display *dpy, XserverRegion region) {
   paint_root(dpy);
 
   for (w = t; w; w = w->prev_trans) {
+    Picture picture = (w->destroyed || w->a.map_state != IsViewable || w->content_gone)
+        ? (w->fade_picture ? w->fade_picture : w->picture)
+        : w->picture;
+
     XFixesSetPictureClipRegion(dpy,
       root_buffer, 0, 0, w->border_clip);
 
     if(shadow_should_render(w->shadow_type)) {
+      /* The shadow extends past the window; clip it to the area outside
+         the window so it cannot darken the window itself. */
+      if (w->border_size) {
+        XFixesSubtractRegion(dpy, g_xregion_tmp, w->extents, w->border_size);
+        XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, g_xregion_tmp);
+      } else {
+        XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, w->extents);
+      }
       XRenderComposite(
         dpy, PictOpOver, cshadow_picture, w->shadow,
         root_buffer, 0, 0, 0, 0,
@@ -1155,10 +1526,7 @@ paint_all(Display *dpy, XserverRegion region) {
         w->shadow_width, w->shadow_height);
     }
 
-    if (w->opacity != OPAQUE && !w->alpha_pict) {
-      w->alpha_pict = solid_picture(
-        dpy, False, (double)w->opacity / OPAQUE, 0, 0, 0);
-    }
+    update_alpha_pict(dpy, w);
     if (HAS_FRAME_OPACITY(w) && !w->alpha_border_pict) {
       w->alpha_border_pict = solid_picture(
         dpy, False, frame_opacity, 0, 0, 0);
@@ -1187,9 +1555,15 @@ paint_all(Display *dpy, XserverRegion region) {
       set_ignore(dpy, NextRequest(dpy));
 
       if (!HAS_FRAME_OPACITY(w)) {
-        XRenderComposite(
-          dpy, PictOpOver, w->picture, w->alpha_pict,
-          root_buffer, 0, 0, 0, 0, x, y, wid, hei);
+        if (w->rounded_mask_picture && w->opacity == OPAQUE) {
+          XRenderComposite(
+            dpy, PictOpOver, picture, w->rounded_mask_picture,
+            root_buffer, 0, 0, 0, 0, x, y, wid, hei);
+        } else {
+          XRenderComposite(
+            dpy, PictOpOver, picture, w->alpha_pict,
+            root_buffer, 0, 0, 0, 0, x, y, wid, hei);
+        }
       } else {
         /* TODO - clean me */
         unsigned int t = w->top_width;
@@ -1199,38 +1573,41 @@ paint_all(Display *dpy, XserverRegion region) {
 
         /* top */
         XRenderComposite(
-          dpy, PictOpOver, w->picture, w->alpha_border_pict, root_buffer,
+          dpy, PictOpOver, picture, w->alpha_border_pict, root_buffer,
           0, 0, 0, 0, x, y, wid, t);
 
         /* left */
         XRenderComposite(
-          dpy, PictOpOver, w->picture, w->alpha_border_pict, root_buffer,
+          dpy, PictOpOver, picture, w->alpha_border_pict, root_buffer,
           0, t, 0, t, x, y + t, l, hei - t);
 
         /* bottom */
         XRenderComposite(
-          dpy, PictOpOver, w->picture, w->alpha_border_pict, root_buffer,
+          dpy, PictOpOver, picture, w->alpha_border_pict, root_buffer,
           l, hei - b, l, hei - b, x + l, y + hei - b, wid - l - r, b);
 
         /* right */
         XRenderComposite(
-          dpy, PictOpOver, w->picture, w->alpha_border_pict, root_buffer,
+          dpy, PictOpOver, picture, w->alpha_border_pict, root_buffer,
           wid - r, t, wid - r, t, x + wid - r, y + t, r, hei - t);
 
         /* body */
         XRenderComposite(
-          dpy, PictOpOver, w->picture, w->alpha_pict, root_buffer,
+          dpy, PictOpOver, picture, w->alpha_pict, root_buffer,
           l, t, l, t, x + l, y + t, wid - l - r, hei - t - b);
       }
     }
   }
 
+    if (dmg_rects) XFree(dmg_rects);
+
 #if ! MONITOR_REPAINT
-    XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, None);
+    XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, g_saved_damage);
     XRenderComposite(
       dpy, PictOpSrc, root_buffer, None,
       root_picture, 0, 0, 0, 0,
       0, 0, root_width, root_height);
+    XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, None);
 #endif // ! MONITOR_REPAINT
 }
 
@@ -1287,64 +1664,12 @@ repair_win(Display *dpy, win *w) {
 
   add_damage(dpy, parts);
   w->damaged = 1;
-}
 
-#if 0
-static const char*
-wintype_name(wintype type) {
-  const char *t;
-
-  switch (type) {
-    case WINTYPE_DESKTOP:
-      t = "desktop";
-      break;
-    case WINTYPE_DOCK:
-      t = "dock";
-      break;
-    case WINTYPE_TOOLBAR:
-      t = "toolbar";
-      break;
-    case WINTYPE_MENU:
-      t = "menu";
-      break;
-    case WINTYPE_UTILITY:
-      t = "utility";
-      break;
-    case WINTYPE_SPLASH:
-      t = "slash";
-      break;
-    case WINTYPE_DIALOG:
-      t = "dialog";
-      break;
-    case WINTYPE_NORMAL:
-      t = "normal";
-      break;
-    case WINTYPE_DROPDOWN_MENU:
-      t = "dropdown";
-      break;
-    case WINTYPE_POPUP_MENU:
-      t = "popup";
-      break;
-    case WINTYPE_TOOLTIP:
-      t = "tooltip";
-      break;
-    case WINTYPE_NOTIFY:
-      t = "notification";
-      break;
-    case WINTYPE_COMBO:
-      t = "combo";
-      break;
-    case WINTYPE_DND:
-      t = "dnd";
-      break;
-    default:
-      t = "unknown";
-      break;
+  if (w->picture) {
+    update_fade_snapshot(dpy, w);
   }
-
-  return t;
 }
-#endif
+
 
 static wintype
 get_wintype_prop(Display * dpy, Window w) {
@@ -1364,7 +1689,7 @@ get_wintype_prop(Display * dpy, Window w) {
 
     if (unlikely(result != Success)) break;
 
-    if (likely(data != None)) {
+    if (likely(data != None) && format == 32 && n >= 1) {
       int i;
       for (i = 1; i < NUM_WINTYPES; ++i) {
         Atom a;
@@ -1429,20 +1754,31 @@ map_win(Display *dpy, Window id,
   if (unlikely(!w)) return;
 
   w->a.map_state = IsViewable;
+  w->content_gone = False;
+  w->snapshot_stale = False;
   w->window_type = determine_wintype(dpy, w->id, w->id);
+
+  /* Remember whether this window has client subwindows: a window that loses
+     all of them is closing, while one that never had any (override-redirect
+     menus, non-reparented clients) still owns its content. */
+  {
+    Window rr, pp, *ch = NULL;
+    unsigned int nch = 0;
+    if (XQueryTree(dpy, w->id, &rr, &pp, &ch, &nch)) {
+      w->had_children = (nch > 0);
+    }
+    if (ch) XFree(ch);
+  }
 
   if (! w->border_clip) {
     w->border_clip = XFixesCreateRegion(dpy, 0, 0);
   }
 
-#if 0
-  printf("window 0x%x type %s\n",
-    w->id, wintype_name(w->window_type));
-#endif
 
   /* select before reading the property
      so that no property changes are lost */
-  XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask);
+  XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask
+      | SubstructureNotifyMask);
 
   // this causes problems for inactive transparency
   //w->opacity = get_opacity_prop(dpy, w, OPAQUE);
@@ -1490,6 +1826,40 @@ finish_unmap_win(Display *dpy, win *w) {
   }
 #endif
 
+  if (w->fade_picture) {
+    XRenderFreePicture(dpy, w->fade_picture);
+    w->fade_picture = None;
+  }
+  if (w->fade_pixmap) {
+    XFreePixmap(dpy, w->fade_pixmap);
+    w->fade_pixmap = None;
+  }
+
+  if (w->alpha_pict) {
+    XRenderFreePicture(dpy, w->alpha_pict);
+    w->alpha_pict = None;
+  }
+  if (w->alpha_pixmap) {
+    XFreePixmap(dpy, w->alpha_pixmap);
+    w->alpha_pixmap = None;
+  }
+  w->alpha_pict_value = 0xffffffff;
+
+  /* Release the rounded-corner mask/region as well: they are rebuilt on the
+     next paint after the window is mapped again. */
+  if (w->rounded_mask_picture) {
+    XRenderFreePicture(dpy, w->rounded_mask_picture);
+    w->rounded_mask_picture = None;
+  }
+  if (w->rounded_mask_pixmap) {
+    XFreePixmap(dpy, w->rounded_mask_pixmap);
+    w->rounded_mask_pixmap = None;
+  }
+  if (w->rounded) {
+    XFixesDestroyRegion(dpy, w->rounded);
+    w->rounded = None;
+  }
+
   if (w->picture) {
     set_ignore(dpy, NextRequest(dpy));
     XRenderFreePicture(dpy, w->picture);
@@ -1508,6 +1878,123 @@ finish_unmap_win(Display *dpy, win *w) {
   }
 
   clip_changed = True;
+}
+
+/* Keep a copy of the window's visible contents.  The client window is
+   usually destroyed before its frame is unmapped, so at fade-out time the
+   frame's composite pixmap only contains the bare frame.  Updating this
+   snapshot whenever the window repaints preserves the last real contents
+   for the fade-out. */
+static void
+update_fade_snapshot(Display *dpy, win *w) {
+  int wd, ht, mw, mh;
+  XRenderPictFormat *format;
+  XRenderPictureAttributes pa;
+  XTransform up = { { { XDoubleToFixed(2.0), 0, 0 },
+                      { 0, XDoubleToFixed(2.0), 0 },
+                      { 0, 0, XDoubleToFixed(1.0) } } };
+  XTransform identity = { { { XDoubleToFixed(1.0), 0, 0 },
+                            { 0, XDoubleToFixed(1.0), 0 },
+                            { 0, 0, XDoubleToFixed(1.0) } } };
+
+  if (!w->picture || w->a.class == InputOnly || w->a.depth == 0) return;
+  if (w->a.map_state != IsViewable || w->destroyed) return;
+  /* Only windows that fade need the snapshot. */
+  if (!win_type_fade[w->window_type]) return;
+  /* Skip fully occluded windows; the snapshot is refreshed once they
+     become visible again. */
+  if (!w->paint_needed) return;
+
+  win_outer_rect(w, NULL, NULL, &wd, &ht);
+  if (wd <= 0 || ht <= 0) return;
+
+  /* Throttle: skip refreshes that come faster than one frame.  The first
+     copy and size changes always go through.  A skipped refresh also skips
+     the vanished-client check below: nothing is copied, so the snapshot
+     cannot be overwritten with empty contents.  Client destruction is
+     still caught by the DestroyNotify path, and any later damage that
+     passes the throttle re-checks. */
+  {
+    struct timespec ts;
+    unsigned long long now;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (unsigned long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (w->fade_pixmap && wd == w->fade_w && ht == w->fade_h
+        && now - w->last_snap_ms < SNAPSHOT_MIN_INTERVAL_MS) {
+      return;
+    }
+    w->last_snap_ms = now;
+  }
+
+  /* Check for a vanished client: once the client window is gone the
+     frame's live contents are empty, and copying them would overwrite the
+     last useful snapshot (a flash of the background). */
+  if (w->fade_picture && w->had_children) {
+    Window rr, pp, *ch = NULL;
+    unsigned int nch = 0;
+    Bool ok = XQueryTree(dpy, w->id, &rr, &pp, &ch, &nch);
+    if (ch) XFree(ch);
+    if (!ok || nch == 0) {
+      /* The client window is gone while the frame is still mapped:
+         keep the last snapshot and paint from it from now on. */
+      w->content_gone = True;
+      return;
+    }
+  }
+
+  /* Half-resolution snapshot: a quarter of the memory.  It is scaled back
+     up when painted (0.5 sampling transform + bilinear, set up below), and
+     the content is scaled down on every update (2.0 sampling transform on
+     the source).  For a 2x reduction the bilinear filter samples exactly
+     at the corner shared by 2x2 source pixels, averaging them. */
+  mw = (wd + 1) / 2;
+  mh = (ht + 1) / 2;
+
+  if (w->fade_pixmap && (wd != w->fade_w || ht != w->fade_h)) {
+    XRenderFreePicture(dpy, w->fade_picture);
+    w->fade_picture = None;
+    XFreePixmap(dpy, w->fade_pixmap);
+    w->fade_pixmap = None;
+  }
+
+  if (!w->fade_pixmap) {
+    format = XRenderFindVisualFormat(dpy, w->a.visual);
+    if (!format) return;
+    w->fade_pixmap = XCreatePixmap(dpy, DefaultRootWindow(dpy),
+        mw, mh, w->a.depth);
+    if (!w->fade_pixmap) return;
+    pa.subwindow_mode = IncludeInferiors;
+    w->fade_picture = XRenderCreatePicture(
+        dpy, w->fade_pixmap, format, CPSubwindowMode, &pa);
+    if (!w->fade_picture) {
+      XFreePixmap(dpy, w->fade_pixmap);
+      w->fade_pixmap = None;
+      return;
+    }
+    w->fade_w = wd;
+    w->fade_h = ht;
+
+    /* Scale the snapshot back up to window size when it is painted.  The
+       0.25 translation keeps the upscaled image centred on the snapshot
+       pixels (sampling uses the picture's own coordinates). */
+    {
+      XTransform down = { { { XDoubleToFixed(0.5), 0, XDoubleToFixed(0.25) },
+                           { 0, XDoubleToFixed(0.5), XDoubleToFixed(0.25) },
+                           { 0, 0, XDoubleToFixed(1.0) } } };
+      XRenderSetPictureTransform(dpy, w->fade_picture, &down);
+      XRenderSetPictureFilter(dpy, w->fade_picture, "bilinear", NULL, 0);
+    }
+  }
+
+  /* Scale the window contents down into the snapshot.  The source
+     transform lasts only for the compositing request below; paint_all's
+     own use of w->picture comes later on the wire, after the reset. */
+  XRenderSetPictureTransform(dpy, w->picture, &up);
+  XRenderSetPictureFilter(dpy, w->picture, "bilinear", NULL, 0);
+  XRenderComposite(dpy, PictOpSrc, w->picture, None, w->fade_picture,
+      0, 0, 0, 0, 0, 0, mw, mh);
+  XRenderSetPictureTransform(dpy, w->picture, &identity);
+  XRenderSetPictureFilter(dpy, w->picture, "nearest", NULL, 0);
 }
 
 #if HAS_NAME_WINDOW_PIXMAP
@@ -1533,6 +2020,23 @@ unmap_win(Display *dpy, Window id, Bool fade) {
 
 #if HAS_NAME_WINDOW_PIXMAP
   if (w->pixmap && fade && win_type_fade[w->window_type]) {
+    /* Freeze the border geometry as a rectangle: the X window may be
+       destroyed before the fade ends, and re-querying its shape then
+       would produce an invalid region. */
+    if (w->border_size) {
+      set_ignore(dpy, NextRequest(dpy));
+      XFixesDestroyRegion(dpy, w->border_size);
+    }
+    {
+      XRectangle r;
+      int x, y, wd, ht;
+      win_outer_rect(w, &x, &y, &wd, &ht);
+      r.x = x;
+      r.y = y;
+      r.width = wd;
+      r.height = ht;
+      w->border_size = XFixesCreateRegion(dpy, &r, 1);
+    }
     set_fade(dpy, w, w->opacity * 1.0 / OPAQUE, 0.0,
              fade_out_step, unmap_callback, False, True);
   } else
@@ -1571,7 +2075,7 @@ get_opacity_prop(Display *dpy, win *w, unsigned int def) {
     dpy, w->id, atom_opacity, 0L, 1L, False,
     XA_CARDINAL, &actual, &format, &n, &left, &data);
 
-  if (result == Success && data != NULL) {
+  if (result == Success && data != NULL && format == 32 && n >= 1) {
     unsigned int i;
     memcpy(&i, data, sizeof(unsigned int));
     XFree((void *)data);
@@ -1603,20 +2107,13 @@ determine_mode(Display *dpy, win *w) {
 
   /* if trans prop == -1 fall back on  previous tests*/
 
-  if (w->alpha_pict) {
-    XRenderFreePicture(dpy, w->alpha_pict);
-    w->alpha_pict = None;
-  }
+  /* alpha_pict is reused by update_alpha_pict (1x1 mask, refilled). */
 
   if (w->alpha_border_pict) {
     XRenderFreePicture(dpy, w->alpha_border_pict);
     w->alpha_border_pict = None;
   }
 
-  if (w->shadow_pict) {
-    XRenderFreePicture(dpy, w->shadow_pict);
-    w->shadow_pict = None;
-  }
 
   if (w->a.class == InputOnly) {
     format = 0;
@@ -1711,8 +2208,8 @@ add_win(Display *dpy, Window id, Window prev) {
   }
 
   new->alpha_pict = None;
+  new->alpha_pict_value = 0xffffffff;
   new->alpha_border_pict = None;
-  new->shadow_pict = None;
   new->border_size = None;
   new->extents = None;
   new->shadow = None;
@@ -1792,6 +2289,7 @@ static void
 do_configure_win(Display *dpy, win* w){
   XConfigureEvent* ce = &w->queue_configure;
 
+  int old_x = w->a.x, old_y = w->a.y;
   w->need_configure = False;
   w->a.x = ce->x;
   w->a.y = ce->y;
@@ -1817,6 +2315,14 @@ do_configure_win(Display *dpy, win* w){
   w->a.width = ce->width;
   w->a.height = ce->height;
   w->a.border_width = ce->border_width;
+
+  if (w->configure_size_changed) {
+    update_rounded_region(dpy, w);
+    update_rounded_mask(dpy, w);
+  } else if (w->rounded && (ce->x != old_x || ce->y != old_y)) {
+    /* Only moved: shift the hard-edged rounded region instead of rebuilding. */
+    XFixesTranslateRegion(dpy, w->rounded, ce->x - old_x, ce->y - old_y);
+  }
 
   if (w->a.map_state != IsUnmapped
 #if CAN_DO_USABLE
@@ -1964,25 +2470,6 @@ destroy_win(Display *dpy, Window id, Bool fade) {
   }
 }
 
-#if 0
-static void
-dump_win(win *w) {
-  printf("\t%08lx: %d x %d + %d + %d(%d)\n", w->id,
-    w->a.width, w->a.height,
-    w->a.x, w->a.y, w->a.border_width);
-}
-
-
-static void
-dump_wins(void) {
-  win *w;
-
-  printf("windows:\n");
-  for (w = list; w; w = w->next) {
-    dump_win(w);
-  }
-}
-#endif
 
 static void
 damage_win(Display *dpy, XDamageNotifyEvent *de) {
@@ -2015,17 +2502,6 @@ damage_win(Display *dpy, XDamageNotifyEvent *de) {
       }
     }
 
-#if 0
-    printf("unusable damage %d, %d: %d x %d bounds %d, %d: %d x %d\n",
-      de->area.x,
-      de->area.y,
-      de->area.width,
-      de->area.height,
-      w->damage_bounds.x,
-      w->damage_bounds.y,
-      w->damage_bounds.width,
-      w->damage_bounds.height);
-#endif
 
     if (w->damage_bounds.x <= 0
         && w->damage_bounds.y <= 0
@@ -2198,11 +2674,11 @@ usage(char *program, int exitcode) {
     -t top-offset
     The top offset for shadows. (default -15)
     -I fade-in-step
-    Opacity change between steps while fading in. (default 0.028)
+    Opacity change between steps while fading in. (default 0.08)
     -O fade-out-step
-    Opacity change between steps while fading out. (default 0.03)
+    Opacity change between steps while fading out. (default 0.08)
     -D fade-delta-time
-    The time between steps in a fade in milliseconds. (default 10)
+    The time between steps in a fade in milliseconds. (default 32)
     -m opacity
     The opacity for menus. (default 1.0)
     -c
@@ -2217,6 +2693,8 @@ usage(char *program, int exitcode) {
     Opacity of inactive windows. (0.1 - 1.0)
     -e opacity
     Opacity of window titlebars and borders. (0.1 - 1.0)
+    -R radius
+    The radius for rounded window corners. (default 8, 0 disables)
     -S
     Enable synchronous operation (for debugging).
     --shadow-red value
@@ -2339,6 +2817,7 @@ main(int argc, char **argv) {
     { "shadow-green", required_argument, NULL, 0 },
     { "shadow-blue", required_argument, NULL, 0 },
     { "help", no_argument, NULL, 0 },
+    { "corner-radius", required_argument, NULL, 'R' },
     { 0, 0, 0, 0 },
   };
 
@@ -2370,7 +2849,7 @@ main(int argc, char **argv) {
     win_type_opacity[i] = 1.0;
   }
 
-  while ((o = getopt_long(argc, argv, "D:I:O:d:r:o:m:l:t:i:e:schnfFCaS",
+  while ((o = getopt_long(argc, argv, "D:I:O:R:d:r:o:m:l:t:i:e:schnfFCaS",
                           longopt, &longopt_idx)) != -1) {
     switch (o) {
        // Long options
@@ -2392,7 +2871,7 @@ main(int argc, char **argv) {
       case 'D':
         fade_delta = atoi(optarg);
         if (fade_delta < 1) {
-          fade_delta = 10;
+          fade_delta = 32;
         }
         break;
       case 'I':
@@ -2449,6 +2928,13 @@ main(int argc, char **argv) {
         break;
       case 'e':
         frame_opacity = (double)atof(optarg);
+        break;
+      case 'R':
+        corner_radius = atoi(optarg);
+        if (corner_radius < 0) corner_radius = 0;
+        if (corner_radius > MAX_CORNER_RADIUS) {
+          corner_radius = MAX_CORNER_RADIUS;
+        }
         break;
       case 'n':
       case 'a':
@@ -2512,6 +2998,7 @@ main(int argc, char **argv) {
 
   if(! register_cm(dpy))
     exit(1);
+
 
   /* get atoms */
   atom_opacity = XInternAtom(dpy,
@@ -2579,9 +3066,12 @@ main(int argc, char **argv) {
     cshadow_picture = solid_picture(dpy, True, 1,
         shadow_red, shadow_green, shadow_blue);
 
+  init_corner_templates(dpy);
+
   all_damage = XFixesCreateRegion(dpy, 0, 0);
   all_damage_is_dirty = False;
   g_xregion_tmp = XFixesCreateRegion(dpy, 0, 0);
+  g_saved_damage = XFixesCreateRegion(dpy, 0, 0);
 
   clip_changed = True;
   XGrabServer(dpy);
@@ -2620,11 +3110,12 @@ main(int argc, char **argv) {
     /*    dump_wins(); */
     do {
       if (!QLength(dpy)) {
-        // TODO: check and re-implement fade time logic.
         int timeout = (configure_timer_started) ? 2 : fade_timeout();
         if (unlikely(poll(&ufd, 1, timeout) == 0)) {
+          if (fades) {
+            run_fades(dpy);
+          }
           check_paint(dpy);
-           //   run_fades(dpy);
           break;
         }
       }
@@ -2672,15 +3163,23 @@ main(int argc, char **argv) {
           break;
         }
         case CreateNotify:
-          //if (ev.xcreatewindow.override_redirect) break;
-          add_win(dpy, ev.xcreatewindow.window, 0);
+          /* Only manage top-level windows (direct children of root); the
+             substructure events of our frames also report client windows. */
+          if (ev.xcreatewindow.parent == root) {
+            add_win(dpy, ev.xcreatewindow.window, 0);
+          }
           break;
         case ConfigureNotify:
           handle_ConfigureNotify(dpy, &ev.xconfigure);
           break;
-        case DestroyNotify:
+        case DestroyNotify: {
+          win *parent = find_win(ev.xdestroywindow.event);
+          if (parent && parent->id != ev.xdestroywindow.window) {
+            parent->content_gone = True;
+          }
           destroy_win(dpy, ev.xdestroywindow.window, True);
           break;
+        }
         case MapNotify:
           map_win(dpy, ev.xmap.window, ev.xmap.serial, True);
           break;
@@ -2698,7 +3197,7 @@ main(int argc, char **argv) {
           // a hidden window where the client is reparented may remain hidden.
           // I did not see this in pracice though, since we take the _NET_WM_STATE_HIDDEN
           // from the client window and the client *should* be tied to its toplevel window.
-          if (ev.xreparent.parent == root) {
+          if (ev.xreparent.event == root && ev.xreparent.parent == root) {
             add_win(dpy, ev.xreparent.window, 0);
           } else {
             add_damage_if_hidden_changed(ev.xreparent.window, true);
@@ -2771,6 +3270,11 @@ main(int argc, char **argv) {
             damage_win(dpy, (XDamageNotifyEvent *)&ev);
           }
           break;
+      }
+      /* Advance fades with elapsed time even while events keep arriving:
+         the poll-timeout branch below is only reached on idle streams. */
+      if (fades) {
+        run_fades(dpy);
       }
     } while (QLength(dpy));
 
