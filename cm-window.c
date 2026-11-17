@@ -37,7 +37,7 @@ static AtomArr _query_atom_values(Window window, Atom property) {
     return ret;
   }
   if(unlikely(actual_format != 32)){
-    fprintf(stderr, "fastcompmgr error: expected actual_format==32, got %d\n",
+    fprintf(stderr, "litecompmgr error: expected actual_format==32, got %d\n",
             actual_format);
     XFree(atoms);
     memset(&ret, 0, sizeof(AtomArr));

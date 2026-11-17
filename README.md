@@ -1,34 +1,77 @@
-# fastcompmgr
+# litecompmgr
 
-__fastcompmgr__ is a _fast_ compositor for X, a fork of an early version
-of __Compton__ which is a fork of __xcompmgr-dana__ which is a fork
-of __xcompmgr__.
+__litecompmgr__ is a lightweight compositor for X11, forked from
+[fastcompmgr 0.6.1](https://github.com/tycho-kirchner/fastcompmgr)
+(which is based on xcompmgr-dana, xcompmgr and an early version of compton).
 
-I used to use good old xcompmgr for long, because compton always
-felt a bit laggy when moving/resizing windows or kinetic-scrolling
-a webpage. Having tested the latest picom-10.2, it seems, things got even
-worse (see benchmark below). However, xcompmgr does not draw shadows
-on argb windows (e.g. some terminals) and
-has several other glitches. That's why I traveled back into 2011, where
-this feature was just added, cherry picked some later compton commits
-to get rid of spurious segfaults and memleaks and made that version even
-faster, based on profiling.
-For example, window move- and resize events are limited in their
-event-count and rendered at a somewhat fixed framerate, while
-scrolling is still done as fast as possible. Occluded windows are not
-painted and memory allocations/deallocations are largely avoided,
-allowing for faster repaints of the screen.
-On the downside, fading is currently broken (I don't use it). Sorry
-for that (;
+It keeps the minimal, single-buffer XRender design of its ancestors and adds
+what was missing for everyday desktop use: working window fading, a fade-out
+of the last real window contents, anti-aliased rounded corners, and lower
+per-frame compositing overhead.
 
-## Benchmark
-While on my Dell Latitude E5570 window moving, resizing and scrolling
-*feels* clearly faster, there are also some numbers to support this
-observation. Given a number of stacked chromium-windows, where no window
-is fully occluded, I performed the respective operations *by hand*,
-so please beware that the benchmark is not very sophisticated. The touchpad
-driver `xserver-xorg-input-synaptics` was used which enables for kinetic
-scrolling (Wayland anyone?). The following CPU usages were measured:
+## Features
+
+- **Working fades.** Upstream fastcompmgr ships with `run_fades()` commented
+  out (`-f` does nothing). litecompmgr re-enables and fixes the fade state
+  machine, including fades on busy event streams.
+- **Fade-out keeps the window contents.** A half-resolution ARGB snapshot of
+  each window is kept up to date; after the client window is destroyed the
+  fade-out still shows the real contents instead of an empty frame.
+- **Anti-aliased rounded corners** (`-R radius`, default 8, `0` disables),
+  drawn with a half-resolution A8 mask, scaled up with bilinear filtering.
+- **Client-side shadows** (`-c`), inactive window opacity (`-i`), frame
+  opacity (`-e`) and the other options inherited from fastcompmgr.
+- **Low overhead:**
+  - damage-driven repaints with damage-region clipping;
+  - window border regions are translated on moves and rebuilt only on size
+    changes (no per-frame synchronous shape query);
+  - the per-frame `XFixesFetchRegion` round-trip is skipped below 9 visible
+    windows;
+  - paints are merged to at most one per 16 ms, `XFlush` instead of a
+    blocking `XSync`;
+  - snapshots are refreshed at most once per frame.
+
+## Build
+
+```sh
+make
+sudo make install
+```
+
+Dependencies: libx11, libxcomposite, libxdamage, libxfixes, libxrender
+(plus their pkg-config files).
+
+## Usage
+
+```sh
+litecompmgr -f -F -I 0.08 -O 0.08 -D 32 -R 8 &
+```
+
+Example i3 config line:
+
+```
+exec --no-startup-id litecompmgr -f -F -I 0.08 -O 0.08 -D 32 -R 8 &
+```
+
+See `man litecompmgr` for all options.
+
+## Known limitations
+
+- No vsync. The compositor uses a single full-screen buffer; syncing it to
+  the vertical blank (e.g. via XPresent) was tried and caused flicker, so it
+  is not used. Fast drags of large windows may show minor tearing.
+- No blur, no window rules (per-class opacity/shadow/corner settings), no
+  window animations. Use picom (GLX backend) if you need those.
+- Damage-driven paints are merged with a 16 ms interval; this bounds the
+  added display latency to one frame. Change `PAINT_MIN_INTERVAL_MS` in
+  `litecompmgr.c` to tune it (0 disables merging).
+- Fade-out snapshots cost about 1/4 of a window-sized ARGB buffer per visible
+  window (half resolution).
+
+## Performance
+
+Upstream fastcompmgr's README reports the following numbers (measured by its
+author on a Dell Latitude E5570 with stacked chromium windows):
 
 | Compositor    | move  | resize  | scroll |
 | ------------- | ----- | ------- | ------ |
@@ -37,93 +80,16 @@ scrolling (Wayland anyone?). The following CPU usages were measured:
 | compton       | 26.4% | 6.8%    | 17.1%  |
 | picom         | 29.3% | 8.1%    | 23.1%  |
 
+On top of that, litecompmgr further reduces the CPU cost of scrolling,
+moving and fading windows compared to unmodified fastcompmgr (damage,
+synchronization and frame-pacing changes listed above).
 
-Tools were used with the following flags:
-~~~
-(v0.1) fastcompmgr -o 0.4 -r 12 -c -C
-(v1.1.8 from Debian 11) xcompmgr -o 0.4 -r 12 -c -C
-(v1 from Debian 11) compton --config /dev/null --backend xrender -o 0.4 -r 12 -c -C
-(v10.2) picom --config /dev/null --backend xrender -o 0.4 -r 12 -c
+## Credits
 
-# Calc average using
-$ fastcompmgr -o 0.4 -r 12 -c -C &  pid=$!; sleep 4; \
-    top -b -n 20 -d 0.5 -p $pid | LC_ALL=C awk -v pid=$pid \
-    '$1==PID {++PIDCOUNT} $1==pid && PIDCOUNT>1 {print $9}' |  \
-    datamash mean 1; kill $pid
-~~~
-
-
-
-## Installation
-If you're lazy, just grab the binary from the [release page](https://github.com/tycho-kirchner/fastcompmgr/releases).
-
-Otherwise, install the development versions of the following libraries:
-### Dependencies:
-
-* libx11
-* libxcomposite
-* libxdamage
-* libxfixes
-* libxrender
-* pkg-config
-* make
-
-To build:
-
-~~~ bash
-$ make
-$ make install
-~~~
-
-## Usage
-
-~~~ bash
-$ fastcompmgr -o 0.4 -r 12 -c -C
-~~~
-All options (currently fading doesn't work):
-~~~
-   -d display
-    Which display should be managed.
-   -r radius
-    The blur radius for shadows. (default 12)
-   -o opacity
-    The translucency for shadows. (default .75)
-   -l left-offset
-    The left offset for shadows. (default -15)
-   -t top-offset
-    The top offset for shadows. (default -15)
-   -m opacity
-    The opacity for menus. (default 1.0)
-   -c
-    Enabled client-side shadows on windows.
-   -C
-    Avoid drawing shadows on dock/panel windows.
-   -i opacity
-    Opacity of inactive windows. (0.1 - 1.0)
-   -e opacity
-    Opacity of window titlebars and borders. (0.1 - 1.0)
-    --shadow-red value
-    Red color value of shadow (0.0 - 1.0, defaults to 0).
-    --shadow-green value
-    Green color value of shadow (0.0 - 1.0, defaults to 0).
-    --shadow-blue value
-    Blue color value of shadow (0.0 - 1.0, defaults to 0).
-
-~~~
-
+Based on fastcompmgr by Tycho Kirchner, which is based on
+xcompmgr (Keith Packard, Dana Jansens) and compton (Christopher Jeffrey).
+See LICENSE for the full copyright notices.
 
 ## License
 
-xcompmgr has gotten around. As far as I can tell, the lineage for this
-particular tree is something like:
-
-* Keith Packard (original author)
-* Matthew Hawn
-* ...
-* Dana Jansens
-* Christopher Jeffrey
-* Tycho Kirchner
-
-Not counting the tens of people who forked it in between.
-
-See LICENSE for more info.
+MIT. See [LICENSE](LICENSE).

@@ -1,18 +1,20 @@
 .ds q \N'34'
-.TH fastcompmgr 1
+.TH litecompmgr 1
 .SH NAME
-fastcompmgr \- a _fast_ compositor for X11
+litecompmgr \- a lightweight compositor for X11
 .SH SYNOPSIS
 .nf
-.B fastcompmgr [\-d display] [\-r radius] [\-o opacity] [\-l left-offset] [\-t top-offset] [\-i opacity] [\-e opacity] [\-cCfFS]
+.B litecompmgr [\-d display] [\-r radius] [\-o opacity] [\-l left-offset] [\-t top-offset] [\-i opacity] [\-e opacity] [\-R radius] [\-cCfFS]
 .fi
 .SH DESCRIPTION
-.B fastcompmgr
-is a compositor based on Dana Jansens' version of xcompmgr (which itself was
-written by Keith Packard) and on an early verion of Christopher Jeffrey's
-compton. It includes many improvements over the original
-xcompmgr, including window frame opacity, inactive window transparency,
-and shadows on argb windows.
+.B litecompmgr
+is a lightweight compositor for X11, forked from fastcompmgr 0.6.1 (which
+is based on Dana Jansens' version of xcompmgr and on an early version of
+Christopher Jeffrey's compton). It restores working window fading (including
+fade-out of the last window contents), adds anti-aliased rounded corners,
+and reduces per-frame compositing overhead, while keeping the win\-dow frame
+opacity, inactive window transparency and shadows on argb windows of its
+ancestors.
 .SH OPTIONS
 .TP
 .BI \-d\ display
@@ -59,13 +61,17 @@ Specifies inactive window transparency. (0.1 - 1.0)
 .BI \-e\ opacity
 Specifies window frame transparency. (0.1 - 1.0)
 .TP
+.BI \-R\ radius
+Specifies the corner radius for anti-aliased rounded corners. (default 8, 0 disables)
+.TP
 .BI \-S
 Enables synchronous operation.  Useful for debugging.
 .SH BUGS
-Bugs may be reported to https://github.com/tycho-kirchner/fastcompmgr
+Bugs may be reported via the litecompmgr project's issue tracker.
 .SH AUTHORS
 xcompmgr, originally written by Keith Packard, with contributions from
 Matthew Allum, Eric Anholt, Dan Doel, Thomas Luebking, Matthew Hawn,
 Ely Levy, Phil Blundell, and Carl Worth.
 Compton by Christopher Jeffrey, based on Dana Jansens' original work.
-fastcompmgr by Tycho Kirchner.
+fastcompmgr by Tycho Kirchner. litecompmgr fork maintained by the
+litecompmgr contributors.

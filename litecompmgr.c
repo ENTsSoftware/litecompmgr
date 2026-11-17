@@ -1,10 +1,10 @@
 /*
- * fastcompmgr - a _fast_ compositor for X11
+ * litecompmgr - a lightweight compositor for X11
  *
- * based on xcompmgr - copyright (c) 2003, keith packard
- *                                   2008, Dana Jansens
- *          compton                  2011, Christopher Jeffrey
- *          fastcompmgr              2023, Tycho Kirchner
+ * based on litecompmgr 0.6.1 by Tycho Kirchner, which is based on
+ * xcompmgr - copyright (c) 2003, keith packard
+ *                             2008, Dana Jansens
+ *          compton              2011, Christopher Jeffrey
  *
  * copyright (c) 2023, Tycho Kirchner
  * See LICENSE for more information.
@@ -1145,14 +1145,14 @@ get_frame_extents(win* w,
     // i3 in tabbed mode changes the _NET_WM_STATE attribute from
     // _NET_WM_STATE_FOCUSED to _NET_WM_STATE_HIDDEN when switching tabs. Further, i3
     // spans a "container" window around the client, while only the client has the
-    // _NET_WM_STATE attribute set. Thus, although fastcompmgr normally only listens to
+    // _NET_WM_STATE attribute set. Thus, although litecompmgr normally only listens to
     // events of "container" windows, in this case, we also have to register for
     // "Property" changes of the client window:
     win_register_client_events(client_window);
   }
   w->hidden_type = win_state_is_hidden(client_window) ? HIDDEN_YES : HIDDEN_NO;
 
-  // FIXME: determine the active window on fastcompmgr startup and set opacity accordingly
+  // FIXME: determine the active window on litecompmgr startup and set opacity accordingly
   // if(win_has_focus(client_window)){
   //   fprintf(stderr, "YES, HAS FOCUS: 0x%lx\n", client_window);
   // }
@@ -1189,7 +1189,7 @@ win_paint_needed(win* w, CompRect* ignore_reg){
 
     switch (w->hidden_type) {
     case HIDDEN_UNKNOWN: {
-      fprintf(stderr, "fastcompmgr warning: hidden state still unknown in "
+      fprintf(stderr, "litecompmgr warning: hidden state still unknown in "
                       "win_paint_needed: 0x%lx\n", w->id);
       Window client_window = find_client_win(dpy, w->id);
       if (!client_window) {
@@ -2733,7 +2733,7 @@ register_cm (Display *dpy)
   w = XCreateSimpleWindow (dpy, RootWindow (dpy, g_screen), 0, 0, 1, 1, 0, None,
           None);
 
-  Xutf8SetWMProperties (dpy, w, "fastcompmgr", "fastcompmgr", NULL, 0, NULL, NULL,
+  Xutf8SetWMProperties (dpy, w, "litecompmgr", "litecompmgr", NULL, 0, NULL, NULL,
       NULL);
 
   XSetSelectionOwner (dpy, a, w, 0);
