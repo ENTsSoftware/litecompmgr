@@ -148,6 +148,11 @@ int corner_radius = 8;
    at most one frame behind when a fade-out starts. */
 #define SNAPSHOT_MIN_INTERVAL_MS 16
 
+/* Minimum interval between damage-driven paints.  High-frequency damage
+   streams (scrolling, video) otherwise repaint on every event batch; one
+   frame of merging bounds the added latency. */
+#define PAINT_MIN_INTERVAL_MS 16
+
 #define INACTIVE_OPACITY \
 (unsigned long)((double)inactive_opacity * OPAQUE)
 
@@ -1287,7 +1292,9 @@ paint_all(Display *dpy, XserverRegion region) {
     for (tw = list; tw; tw = tw->next) {
       if (tw->a.map_state == IsViewable) nvis++;
     }
-    if (nvis > 1) {
+    /* Only worth the synchronous round-trip when there are enough windows
+       for the intersection test to skip a significant number of draws. */
+    if (nvis > 8) {
       dmg_rects = XFixesFetchRegion(dpy, region, &ndmg_rects);
     }
   }
@@ -1425,11 +1432,9 @@ paint_all(Display *dpy, XserverRegion region) {
 #endif
 
     if (clip_changed && !w->destroyed && w->a.map_state == IsViewable) {
-      if (w->border_size) {
-        set_ignore(dpy, NextRequest(dpy));
-        XFixesDestroyRegion(dpy, w->border_size);
-        w->border_size = None;
-      }
+      /* border_size follows the window: it is rebuilt on a size change
+         (do_configure_win) and translated on a move, so restacking or
+         repainting does not require a new shape query. */
       win_extents(dpy, w);
     }
 
@@ -1758,18 +1763,6 @@ map_win(Display *dpy, Window id,
   w->snapshot_stale = False;
   w->window_type = determine_wintype(dpy, w->id, w->id);
 
-  /* Remember whether this window has client subwindows: a window that loses
-     all of them is closing, while one that never had any (override-redirect
-     menus, non-reparented clients) still owns its content. */
-  {
-    Window rr, pp, *ch = NULL;
-    unsigned int nch = 0;
-    if (XQueryTree(dpy, w->id, &rr, &pp, &ch, &nch)) {
-      w->had_children = (nch > 0);
-    }
-    if (ch) XFree(ch);
-  }
-
   if (! w->border_clip) {
     w->border_clip = XFixesCreateRegion(dpy, 0, 0);
   }
@@ -1909,11 +1902,9 @@ update_fade_snapshot(Display *dpy, win *w) {
   if (wd <= 0 || ht <= 0) return;
 
   /* Throttle: skip refreshes that come faster than one frame.  The first
-     copy and size changes always go through.  A skipped refresh also skips
-     the vanished-client check below: nothing is copied, so the snapshot
-     cannot be overwritten with empty contents.  Client destruction is
-     still caught by the DestroyNotify path, and any later damage that
-     passes the throttle re-checks. */
+     copy and size changes always go through.  Client destruction is caught
+     by the DestroyNotify path; a snapshot update that races it cannot
+     occur because the throttled damage is not copied at all. */
   {
     struct timespec ts;
     unsigned long long now;
@@ -1926,21 +1917,6 @@ update_fade_snapshot(Display *dpy, win *w) {
     w->last_snap_ms = now;
   }
 
-  /* Check for a vanished client: once the client window is gone the
-     frame's live contents are empty, and copying them would overwrite the
-     last useful snapshot (a flash of the background). */
-  if (w->fade_picture && w->had_children) {
-    Window rr, pp, *ch = NULL;
-    unsigned int nch = 0;
-    Bool ok = XQueryTree(dpy, w->id, &rr, &pp, &ch, &nch);
-    if (ch) XFree(ch);
-    if (!ok || nch == 0) {
-      /* The client window is gone while the frame is still mapped:
-         keep the last snapshot and paint from it from now on. */
-      w->content_gone = True;
-      return;
-    }
-  }
 
   /* Half-resolution snapshot: a quarter of the memory.  It is scaled back
      up when painted (0.5 sampling transform + bilinear, set up below), and
@@ -2319,9 +2295,20 @@ do_configure_win(Display *dpy, win* w){
   if (w->configure_size_changed) {
     update_rounded_region(dpy, w);
     update_rounded_mask(dpy, w);
-  } else if (w->rounded && (ce->x != old_x || ce->y != old_y)) {
-    /* Only moved: shift the hard-edged rounded region instead of rebuilding. */
-    XFixesTranslateRegion(dpy, w->rounded, ce->x - old_x, ce->y - old_y);
+    /* The window shape follows the size; rebuilt on the next paint. */
+    if (w->border_size) {
+      set_ignore(dpy, NextRequest(dpy));
+      XFixesDestroyRegion(dpy, w->border_size);
+      w->border_size = None;
+    }
+  } else if (ce->x != old_x || ce->y != old_y) {
+    /* Only moved: shift the cached regions instead of rebuilding them. */
+    if (w->rounded) {
+      XFixesTranslateRegion(dpy, w->rounded, ce->x - old_x, ce->y - old_y);
+    }
+    if (w->border_size) {
+      XFixesTranslateRegion(dpy, w->border_size, ce->x - old_x, ce->y - old_y);
+    }
   }
 
   if (w->a.map_state != IsUnmapped
@@ -2762,10 +2749,13 @@ static void run_configures(Display *dpy){
   }
 }
 
+static int g_last_paint_ms;
+
 static void
 do_paint(Display *dpy){
    paint_all(dpy, all_damage);
-   XSync(dpy, False);
+   XFlush(dpy);
+   g_last_paint_ms = get_time_in_milliseconds();
    all_damage_is_dirty = False;
    clip_changed = False;
 }
@@ -2803,7 +2793,9 @@ check_paint(Display *dpy){
       do_paint(dpy);
     }
   } else {
-    if(likely(all_damage_is_dirty)) {
+    if(likely(all_damage_is_dirty)
+       && get_time_in_milliseconds() - g_last_paint_ms
+          >= PAINT_MIN_INTERVAL_MS) {
       do_paint(dpy);
     }
   }
@@ -3111,6 +3103,12 @@ main(int argc, char **argv) {
     do {
       if (!QLength(dpy)) {
         int timeout = (configure_timer_started) ? 2 : fade_timeout();
+        if (all_damage_is_dirty) {
+          int remain = PAINT_MIN_INTERVAL_MS
+              - (get_time_in_milliseconds() - g_last_paint_ms);
+          if (remain < 0) remain = 0;
+          if (timeout < 0 || remain < timeout) timeout = remain;
+        }
         if (unlikely(poll(&ufd, 1, timeout) == 0)) {
           if (fades) {
             run_fades(dpy);

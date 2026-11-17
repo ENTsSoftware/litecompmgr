@@ -78,7 +78,6 @@ typedef struct _win {
   Pixmap alpha_pixmap;
   Picture alpha_pict;
   unsigned int alpha_pict_value;
-  Bool had_children; /* had client subwindows when mapped */
   Picture alpha_border_pict;
   Picture shadow_pict;
   XserverRegion border_size;
