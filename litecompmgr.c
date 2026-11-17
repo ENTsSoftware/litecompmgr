@@ -1335,6 +1335,9 @@ paint_all(Display *dpy, XserverRegion region) {
     //   do_configure_win(dpy, w);
     // }
 
+    /* InputOnly windows have no drawable contents to composite. */
+    if (w->a.class == InputOnly) continue;
+
 #if CAN_DO_USABLE
     if (!w->usable) continue;
 #endif
@@ -1389,6 +1392,10 @@ paint_all(Display *dpy, XserverRegion region) {
 
 #if HAS_NAME_WINDOW_PIXMAP
       if (has_name_pixmap && !w->pixmap) {
+        /* The window may have been destroyed between discovery and this
+           first paint; naming its pixmap would leave a broken picture. */
+        XWindowAttributes a;
+        if (unlikely(!XGetWindowAttributes(dpy, w->id, &a))) continue;
         set_ignore(dpy, NextRequest(dpy));
         w->pixmap = XCompositeNameWindowPixmap(dpy, w->id);
       }
@@ -1396,9 +1403,11 @@ paint_all(Display *dpy, XserverRegion region) {
 #endif
 
       format = XRenderFindVisualFormat(dpy, w->a.visual);
-      pa.subwindow_mode = IncludeInferiors;
-      w->picture = XRenderCreatePicture(
-        dpy, draw, format, CPSubwindowMode, &pa);
+      if (likely(format)) {
+        pa.subwindow_mode = IncludeInferiors;
+        w->picture = XRenderCreatePicture(
+          dpy, draw, format, CPSubwindowMode, &pa);
+      }
     }
 
     /* Seed the fade-out snapshot for windows that may never receive
@@ -1784,6 +1793,13 @@ map_win(Display *dpy, Window id,
 #endif
   w->damaged = 0;
   w->paint_needed = True;
+
+  /* Make sure the first paint covers the window: its initial damage may
+     have been produced before we started listening, and the fade below
+     needs a damage source to advance even if the window never repaints. */
+  if (!w->extents) {
+    add_damage(dpy, win_extents(dpy, w));
+  }
 
   if (fade && win_type_fade[w->window_type]) {
     set_fade(
@@ -2221,7 +2237,11 @@ add_win(Display *dpy, Window id, Window prev) {
   if (new->a.map_state == IsViewable) {
     new->window_type = determine_wintype(dpy, id, id);
     new->opacity = win_suggest_opacity(new, &new->userdefined_opacity);
-    map_win(dpy, id, new->damage_sequence - 1, True);
+    /* Do not fade windows that are already mapped when the compositor
+       starts: their first paint would use opacity 0 and a static window
+       may never produce the damage that advances the fade.  New windows
+       still fade in through map events. */
+    map_win(dpy, id, new->damage_sequence - 1, False);
   }
 }
 
@@ -2831,6 +2851,8 @@ main(int argc, char **argv) {
   int o;
   int longopt_idx;
   Bool no_dock_shadow = False;
+  _program_start_secs = time(NULL);
+
   if(!event_init()){
     exit(1);
   }
@@ -3178,9 +3200,16 @@ main(int argc, char **argv) {
           destroy_win(dpy, ev.xdestroywindow.window, True);
           break;
         }
-        case MapNotify:
-          map_win(dpy, ev.xmap.window, ev.xmap.serial, True);
+        case MapNotify: {
+          /* A window that was already viewable when it was discovered and
+             added (fast create+map) was initialized by add_win; re-running
+             the map path would restart its fade from zero. */
+          win *mw = find_win(ev.xmap.window);
+          if (mw && mw->a.map_state != IsViewable) {
+            map_win(dpy, ev.xmap.window, ev.xmap.serial, True);
+          }
           break;
+        }
         case UnmapNotify:
           unmap_win(dpy, ev.xunmap.window, True);
           break;
