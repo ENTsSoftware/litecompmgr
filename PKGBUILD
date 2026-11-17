@@ -12,7 +12,7 @@ url="https://github.com/entssoftware/litecompmgr"
 license=('MIT')
 depends=('glibc' 'libx11' 'libxcomposite' 'libxdamage' 'libxfixes' 'libxrender')
 source=("litecompmgr-$pkgver.tar.gz")
-b2sums=('87f5d9df01b9f901fc4acc65903f267c122fc03948d0e795296b746b315399cfc7c06db7a69b76661924ab11bd9cf660e8913a9cb39f2aa074b0fe48e2077166')
+b2sums=('74de5844401ac88051b47f5aaa89971d828a2467f75eb0068ab2b41835bc86cdc687148993c9cc78eff9629b8fadbfc1a86dea4d508a40f1b672c9a332818e0b')
 
 build() {
   cd "$pkgname-$pkgver"
