@@ -86,9 +86,9 @@ synchronization and frame-pacing changes listed above).
 
 ## Credits
 
-Based on fastcompmgr by Tycho Kirchner, which is based on
-xcompmgr (Keith Packard, Dana Jansens) and compton (Christopher Jeffrey).
-See LICENSE for the full copyright notices.
+litecompmgr is maintained by 清遥Singal, based on fastcompmgr by Tycho
+Kirchner, which is based on xcompmgr (Keith Packard, Dana Jansens) and
+compton (Christopher Jeffrey).  See LICENSE for the full copyright notices.
 
 ## License
 

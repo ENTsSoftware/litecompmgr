@@ -1,12 +1,13 @@
 /*
  * litecompmgr - a lightweight compositor for X11
  *
- * based on litecompmgr 0.6.1 by Tycho Kirchner, which is based on
+ * based on fastcompmgr 0.6.1 by Tycho Kirchner, which is based on
  * xcompmgr - copyright (c) 2003, keith packard
  *                             2008, Dana Jansens
  *          compton              2011, Christopher Jeffrey
  *
  * copyright (c) 2023, Tycho Kirchner
+ * copyright (c) 2026, 清遥Singal
  * See LICENSE for more information.
  *
  */

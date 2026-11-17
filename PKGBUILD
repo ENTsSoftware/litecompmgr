@@ -1,4 +1,4 @@
-# Maintainer: litecompmgr contributors
+# Maintainer: 清遥Singal
 # Fork of fastcompmgr 0.6.1 by Tycho Kirchner.
 # The local tarball source works for local builds; replace "source" with the
 # project's release URL before publishing to the AUR.
