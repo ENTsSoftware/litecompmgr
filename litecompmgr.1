@@ -64,6 +64,13 @@ Specifies window frame transparency. (0.1 - 1.0)
 .BI \-R\ radius
 Specifies the corner radius for anti-aliased rounded corners. (default 8, 0 disables)
 .TP
+.BI \-\-exclude\-class= class
+Disable all effects (fades, rounded corners, shadows) for windows whose
+WM_CLASS (res_name or res_class) matches
+.IR class ,
+case-insensitively. May be given multiple times. The window contents are
+still composited normally.
+.TP
 .BI \-S
 Enables synchronous operation.  Useful for debugging.
 .SH BUGS

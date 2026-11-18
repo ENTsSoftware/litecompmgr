@@ -18,6 +18,7 @@
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
+#include <strings.h>
 #include <math.h>
 #include <sys/poll.h>
 #include <sys/time.h>
@@ -136,6 +137,42 @@ double fade_in_step = 0.08;
 double fade_out_step = 0.08;
 int fade_delta = 32;
 long long fade_time = 0;
+
+/* WM_CLASS names excluded from all effects (fades, rounded corners,
+   shadows).  The window contents are still composited normally. */
+static char **exclude_classes;
+static int n_exclude_classes;
+
+static void
+add_exclude_class(const char *name) {
+  char **n = realloc(exclude_classes,
+      (n_exclude_classes + 1) * sizeof(*n));
+  if (!n) return;
+  exclude_classes = n;
+  exclude_classes[n_exclude_classes++] = strdup(name);
+}
+
+static Bool
+win_is_excluded(Display *dpy, Window id) {
+  XClassHint ch;
+  Bool hit = False;
+  int i;
+
+  if (n_exclude_classes == 0) return False;
+  /* The window may already be gone by the time we ask for WM_CLASS. */
+  set_ignore(dpy, NextRequest(dpy));
+  if (!XGetClassHint(dpy, id, &ch)) return False;
+  for (i = 0; i < n_exclude_classes; i++) {
+    if ((ch.res_name && strcasecmp(ch.res_name, exclude_classes[i]) == 0)
+        || (ch.res_class && strcasecmp(ch.res_class, exclude_classes[i]) == 0)) {
+      hit = True;
+      break;
+    }
+  }
+  if (ch.res_name) XFree(ch.res_name);
+  if (ch.res_class) XFree(ch.res_class);
+  return hit;
+}
 Bool fade_trans = False;
 
 double inactive_opacity = 0;
@@ -752,6 +789,7 @@ paint_root(Display *dpy) {
 }
 
 static shadowtype shadow_find_type(win *w){
+  if (w->excluded) return SHADOW_NO;
   if(unlikely(!w->window_type) ||
      ! win_type_shadow[w->window_type] ||
      is_gtk_frame_extent(dpy, w->id)){
@@ -1426,7 +1464,7 @@ paint_all(Display *dpy, XserverRegion region) {
 
     /* (Re)create the rounded-corner mask/region on first paint after a
        map; both are released when the window is unmapped. */
-    if (corner_radius > 0
+    if (corner_radius > 0 && !w->excluded
         && w->window_type != WINTYPE_DOCK
         && w->window_type != WINTYPE_DESKTOP) {
       if (!w->rounded_mask_picture) {
@@ -1808,7 +1846,7 @@ map_win(Display *dpy, Window id,
      a damage source to advance even if the window never repaints. */
   add_damage(dpy, win_extents(dpy, w));
 
-  if (fade && win_type_fade[w->window_type]) {
+  if (fade && win_type_fade[w->window_type] && !w->excluded) {
     set_fade(
       dpy, w, 0, get_opacity_percent(dpy, w),
       fade_in_step, 0, True, True);
@@ -1916,7 +1954,7 @@ update_fade_snapshot(Display *dpy, win *w) {
   if (!w->picture || w->a.class == InputOnly || w->a.depth == 0) return;
   if (w->a.map_state != IsViewable || w->destroyed) return;
   /* Only windows that fade need the snapshot. */
-  if (!win_type_fade[w->window_type]) return;
+  if (!win_type_fade[w->window_type] || w->excluded) return;
   /* Skip fully occluded windows; the snapshot is refreshed once they
      become visible again. */
   if (!w->paint_needed) return;
@@ -2018,7 +2056,7 @@ unmap_win(Display *dpy, Window id, Bool fade) {
 
 
 #if HAS_NAME_WINDOW_PIXMAP
-  if (w->pixmap && fade && win_type_fade[w->window_type]) {
+  if (w->pixmap && fade && win_type_fade[w->window_type] && !w->excluded) {
     /* Freeze the border geometry as a rectangle: the X window may be
        destroyed before the fade ends, and re-querying its shape then
        would produce an invalid region. */
@@ -2138,7 +2176,7 @@ determine_mode(Display *dpy, win *w) {
 
 static void
 set_opacity(Display *dpy, win *w, unsigned long opacity) {
-  if (fade_trans) {
+  if (fade_trans && !w->excluded) {
     double old_opacity = (double)w->opacity / OPAQUE;
     w->opacity = opacity;
     set_fade(dpy, w, old_opacity,
@@ -2241,6 +2279,8 @@ add_win(Display *dpy, Window id, Window prev) {
   new->next = *p;
   *p = new;
 
+  new->excluded = win_is_excluded(dpy, id);
+
   if (new->a.map_state == IsViewable) {
     new->window_type = determine_wintype(dpy, id, id);
     new->opacity = win_suggest_opacity(new, &new->userdefined_opacity);
@@ -2320,8 +2360,10 @@ do_configure_win(Display *dpy, win* w){
   w->a.border_width = ce->border_width;
 
   if (w->configure_size_changed) {
-    update_rounded_region(dpy, w);
-    update_rounded_mask(dpy, w);
+    if (!w->excluded) {
+      update_rounded_region(dpy, w);
+      update_rounded_mask(dpy, w);
+    }
     /* The window shape follows the size; rebuilt on the next paint. */
     if (w->border_size) {
       set_ignore(dpy, NextRequest(dpy));
@@ -2473,7 +2515,7 @@ destroy_win(Display *dpy, Window id, Bool fade) {
   set_paint_ignore_region_dirty();
 
 #if HAS_NAME_WINDOW_PIXMAP
-  if (w && w->pixmap && fade && win_type_fade[w->window_type]) {
+  if (w && w->pixmap && fade && win_type_fade[w->window_type] && !w->excluded) {
     set_fade(dpy, w, w->opacity * 1.0 / OPAQUE,
       0.0, fade_out_step, destroy_callback,
       False, True);
@@ -2837,6 +2879,7 @@ main(int argc, char **argv) {
     { "shadow-blue", required_argument, NULL, 0 },
     { "help", no_argument, NULL, 0 },
     { "corner-radius", required_argument, NULL, 'R' },
+    { "exclude-class", required_argument, NULL, 0 },
     { 0, 0, 0, 0 },
   };
 
@@ -2880,6 +2923,7 @@ main(int argc, char **argv) {
           case 1: shadow_green = normalize_d(atof(optarg)); break;
           case 2: shadow_blue = normalize_d(atof(optarg)); break;
           case 3: usage(argv[0], 0); break;
+          case 5: add_exclude_class(optarg); break;
           default:
             fprintf(stderr, "Bug, unhandeled longopt_idx %d\n", longopt_idx);
             exit(2);

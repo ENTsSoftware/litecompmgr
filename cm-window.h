@@ -95,6 +95,7 @@ typedef struct _win {
   int shadow_width;
   int shadow_height;
   unsigned int opacity;
+  Bool excluded; /* WM_CLASS in the effect blacklist: no fades/corners/shadows */
   bool userdefined_opacity; // Do not set inactive opacity, if the client requests a custom
   hiddentype hidden_type;
   wintype window_type;

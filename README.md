@@ -19,6 +19,9 @@ per-frame compositing overhead.
   fade-out still shows the real contents instead of an empty frame.
 - **Anti-aliased rounded corners** (`-R radius`, default 8, `0` disables),
   drawn with a half-resolution A8 mask, scaled up with bilinear filtering.
+- **Per-application effect blacklist.** `--exclude-class=rofi` (repeatable)
+  disables fades, rounded corners and shadows for windows whose WM_CLASS
+  matches; their contents are still composited normally.
 - **Client-side shadows** (`-c`), inactive window opacity (`-i`), frame
   opacity (`-e`) and the other options inherited from fastcompmgr.
 - **Low overhead:**
@@ -44,7 +47,8 @@ Dependencies: libx11, libxcomposite, libxdamage, libxfixes, libxrender
 ## Usage
 
 ```sh
-litecompmgr -f -F -I 0.08 -O 0.08 -D 32 -R 8 &
+litecompmgr -f -F -I 0.08 -O 0.08 -D 32 -R 8 \
+    --exclude-class=rofi --exclude-class=fcitx &
 ```
 
 Example i3 config line:
