@@ -16,11 +16,15 @@ extern time_t _program_start_secs;
 #define WRITE_ONCE(x, val) \
 do { ACCESS_ONCE(x) = (val); } while (0)
 
-static inline int
+/* Milliseconds since program start.  64-bit on purpose: with an int this
+   overflows after ~24.8 days and a long-running compositor would stop
+   painting (or park its event loop for weeks). */
+static inline long long
 get_time_in_milliseconds() {
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  return (tv.tv_sec-_program_start_secs) * 1000 + tv.tv_usec / 1000;
+  return (long long)(tv.tv_sec - _program_start_secs) * 1000
+       + tv.tv_usec / 1000;
 }
 
 // normalize double to range 0-1

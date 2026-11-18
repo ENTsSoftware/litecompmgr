@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 #include <math.h>
 #include <sys/poll.h>
 #include <sys/time.h>
@@ -134,7 +135,7 @@ double shadow_opacity = .75;
 double fade_in_step = 0.08;
 double fade_out_step = 0.08;
 int fade_delta = 32;
-int fade_time = 0;
+long long fade_time = 0;
 Bool fade_trans = False;
 
 double inactive_opacity = 0;
@@ -272,10 +273,10 @@ set_fade(Display *dpy, win *w, double start,
   w->damaged = 1;
 }
 
-int
+long long
 fade_timeout(void) {
-  int now;
-  int delta;
+  long long now;
+  long long delta;
 
   if (!fades) return -1;
 
@@ -290,14 +291,19 @@ fade_timeout(void) {
 
 void
 run_fades(Display *dpy) {
-  int now = get_time_in_milliseconds();
+  long long now = get_time_in_milliseconds();
   fade *next = fades;
   int steps;
   Bool need_dequeue;
 
 
   if (fade_time - now > 0) return;
-  steps = 1 + (now - fade_time) / fade_delta;
+  {
+    long long steps_ll = 1 + (now - fade_time) / fade_delta;
+    /* A suspend/resume or a long stall must not overflow the step count. */
+    if (steps_ll > 1000) steps_ll = 1000;
+    steps = (int)steps_ll;
+  }
 
   while (next) {
     fade *f = next;
@@ -1795,12 +1801,12 @@ map_win(Display *dpy, Window id,
   w->damaged = 0;
   w->paint_needed = True;
 
-  /* Make sure the first paint covers the window: its initial damage may
-     have been produced before we started listening, and the fade below
-     needs a damage source to advance even if the window never repaints. */
-  if (!w->extents) {
-    add_damage(dpy, win_extents(dpy, w));
-  }
+  /* Make sure the (re)appearing window is painted: its initial damage may
+     have been produced before we started listening, and a window that is
+     mapped again (menus, input-method candidate windows) would otherwise
+     show a stale frame until its next repaint.  The fade below also needs
+     a damage source to advance even if the window never repaints. */
+  add_damage(dpy, win_extents(dpy, w));
 
   if (fade && win_type_fade[w->window_type]) {
     set_fade(
@@ -2770,7 +2776,7 @@ static void run_configures(Display *dpy){
   }
 }
 
-static int g_last_paint_ms;
+static long long g_last_paint_ms;
 
 static void
 do_paint(Display *dpy){
@@ -2782,7 +2788,7 @@ do_paint(Display *dpy){
 }
 
 static Bool configure_timer_started = False;
-static int configure_time = 0;
+static long long configure_time = 0;
 
 /// When a window is moved, or resized, a lot of ConfigureNotify events
 /// occur. However, painting and Xsyncing of complex windows, e.g.
@@ -2803,7 +2809,7 @@ check_paint(Display *dpy){
       configure_timer_started = True;
       configure_time = get_time_in_milliseconds() + EVERY_MILISEC;
     } else {
-      int delta;
+      long long delta;
       delta = get_time_in_milliseconds() - configure_time;
       if (delta < EVERY_MILISEC){
         return;
@@ -3125,19 +3131,36 @@ main(int argc, char **argv) {
     /*    dump_wins(); */
     do {
       if (!QLength(dpy)) {
-        int timeout = (configure_timer_started) ? 2 : fade_timeout();
+        long long timeout = (configure_timer_started) ? 2 : fade_timeout();
         if (all_damage_is_dirty) {
-          int remain = PAINT_MIN_INTERVAL_MS
+          long long remain = PAINT_MIN_INTERVAL_MS
               - (get_time_in_milliseconds() - g_last_paint_ms);
           if (remain < 0) remain = 0;
           if (timeout < 0 || remain < timeout) timeout = remain;
         }
-        if (unlikely(poll(&ufd, 1, timeout) == 0)) {
-          if (fades) {
-            run_fades(dpy);
+        if (timeout > INT_MAX) timeout = INT_MAX;
+        {
+          int pr = poll(&ufd, 1, (int)timeout);
+          if (unlikely(pr < 0)) {
+            if (errno == EINTR) {
+              /* A signal interrupted the wait.  Do not block in
+                 XNextEvent: there may be damage waiting to be painted. */
+              if (fades) {
+                run_fades(dpy);
+              }
+              check_paint(dpy);
+              break;
+            }
+            usleep(1000);
+            continue;
           }
-          check_paint(dpy);
-          break;
+          if (unlikely(pr == 0)) {
+            if (fades) {
+              run_fades(dpy);
+            }
+            check_paint(dpy);
+            break;
+          }
         }
       }
 
